@@ -92,6 +92,19 @@ app.use(session({
 	logged: false
 }));
 
+// iOS-specific middleware for CORS and headers
+app.use((req, res, next) => {
+	// Enable CORS for iOS WebKit
+	res.header('Access-Control-Allow-Origin', '*');
+	res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
+	res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+	
+	// iOS Safari specific headers
+	res.header('Accept-Ranges', 'bytes');
+	res.header('Cache-Control', 'no-cache');
+	
+	next();
+});
 
 // home page
 app.get("/", function (req, res) {
@@ -100,7 +113,6 @@ app.get("/", function (req, res) {
 	else
 		res.sendFile(__dirname + "/login.html");
 });
-
 
 // receive login info
 app.post("/login", function (req, res) {
@@ -116,55 +128,78 @@ app.post("/login", function (req, res) {
 	
 		res.redirect("/");
 	}
-
 });
 
-
-// video streaming
+// video streaming with iOS compatibility
 app.get("/video", function (req, res) {
-	// Ensure there is a range given for the video
-	const range = req.headers.range;
-	if (!range) {
-		res.status(400).send("Requires Range header");
-	}
-
-	// get video stats (about 61MB)
 	const videoPath = settings.video_path;
-	const videoSize = fs.statSync(videoPath).size;
+	
+	// Check if file exists
+	if (!fs.existsSync(videoPath)) {
+		return res.status(404).send("Video file not found");
+	}
+	
+	const stat = fs.statSync(videoPath);
+	const fileSize = stat.size;
+	const range = req.headers.range;
 
-	// parse Range
-	// Example: "bytes=32324-"
-	const CHUNK_SIZE = 10 ** 6; // 1MB
-	const start = Number(range.replace(/\D/g, ""));
-	const end = Math.min(start + CHUNK_SIZE, videoSize - 1);
-
-	// create headers
-	const contentLength = end - start + 1;
-	const headers = {
-		"Content-Range": `bytes ${start}-${end}/${videoSize}`,
-		"Accept-Ranges": "bytes",
-		"Content-Length": contentLength,
-		"Content-Type": "video/mp4",
-	};
-
-	// HTTP Status 206 for Partial Content
-	res.writeHead(206, headers);
-
-	// create video read stream for this particular chunk
-	const videoStream = fs.createReadStream(videoPath, {
-		start,
-		end
-	});
-
-	// stream the video chunk to the client
-	videoStream.pipe(res);
+	// iOS Safari requires proper range handling
+	if (range) {
+		// Parse range header
+		const parts = range.replace(/bytes=/, "").split("-");
+		const start = parseInt(parts[0], 10);
+		const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+		
+		// Validate range
+		if (start >= fileSize || end >= fileSize) {
+			res.status(416).send('Requested range not satisfiable\n' + start + ' >= ' + fileSize);
+			return;
+		}
+		
+		const chunksize = (end - start) + 1;
+		const file = fs.createReadStream(videoPath, { start, end });
+		const head = {
+			'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+			'Accept-Ranges': 'bytes',
+			'Content-Length': chunksize,
+			'Content-Type': 'video/mp4',
+			// iOS specific headers
+			'Cache-Control': 'no-cache, no-store, must-revalidate',
+			'Pragma': 'no-cache',
+			'Expires': '0'
+		};
+		
+		res.writeHead(206, head);
+		file.pipe(res);
+	} else {
+		// For iOS, we should always support range requests
+		// If no range is specified, send the first chunk
+		const head = {
+			'Content-Length': fileSize,
+			'Content-Type': 'video/mp4',
+			'Accept-Ranges': 'bytes',
+			// iOS specific headers
+			'Cache-Control': 'no-cache, no-store, must-revalidate',
+			'Pragma': 'no-cache',
+			'Expires': '0'
+		};
+		
+		res.writeHead(200, head);
+		
+		// For iOS compatibility, send the entire file if no range specified
+		const stream = fs.createReadStream(videoPath);
+		stream.pipe(res);
+	}
 });
 
+// iOS WebSocket ping endpoint for connection health
+app.get("/ping", function (req, res) {
+	res.json({ status: "ok", timestamp: get_time() });
+});
 
 // host server on given ip and port
 server.listen(settings.server_port,
 	() => console.log(`Server started at:${settings.server_port}`));
-
 
 // function to get the current time
 function get_time() {
