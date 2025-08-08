@@ -1,6 +1,6 @@
 {
     "server_ip": "192.168.56.1",
     "server_port": 5322,
-    "video_path": "videos/shrek.mp4",
+    "video_path": "videos/ep20.mp4",
     "password": "password"
 }
