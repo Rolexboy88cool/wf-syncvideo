@@ -28,6 +28,11 @@ let isBuffering = false;
 let localVideoState = 'paused'; // Track our local state separately
 let ignoreNextEvent = false; // Flag to ignore events we trigger
 
+// Sync status tracking
+let lastSyncTime = 0;
+let syncStatus = 'disconnected'; // 'synced', 'out_of_sync', 'disconnected', 'syncing'
+let currentGap = 0;
+
 // clocks sync variables
 const num_time_sync_cycles = 10;
 let over_estimates = new Array();
@@ -40,6 +45,158 @@ let correction = 0;
 let connectionAttempts = 0;
 const maxReconnectAttempts = 5;
 let reconnectInterval = 1000;
+
+// Create UI elements
+function createSyncUI() {
+    // Container for sync controls
+    const syncContainer = document.createElement('div');
+    syncContainer.id = 'sync-container';
+    syncContainer.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 10000;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        max-width: 200px;
+    `;
+
+    // Status indicator
+    const statusIndicator = document.createElement('div');
+    statusIndicator.id = 'sync-status';
+    statusIndicator.style.cssText = `
+        padding: 8px 12px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 600;
+        text-align: center;
+        color: white;
+        background: #6c757d;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        transition: all 0.3s ease;
+    `;
+    statusIndicator.textContent = 'Disconnected';
+
+    // Re-sync button
+    const resyncButton = document.createElement('button');
+    resyncButton.id = 'resync-button';
+    resyncButton.textContent = '🔄 Re-sync';
+    resyncButton.style.cssText = `
+        padding: 8px 16px;
+        border: none;
+        border-radius: 6px;
+        background: #007AFF;
+        color: white;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        transition: all 0.2s ease;
+    `;
+    
+    resyncButton.addEventListener('mouseenter', () => {
+        resyncButton.style.background = '#0056CC';
+        resyncButton.style.transform = 'translateY(-1px)';
+    });
+    
+    resyncButton.addEventListener('mouseleave', () => {
+        resyncButton.style.background = '#007AFF';
+        resyncButton.style.transform = 'translateY(0)';
+    });
+
+    resyncButton.onclick = () => {
+        console.log('Manual re-sync requested');
+        updateSyncStatus('syncing');
+        do_time_sync();
+        // Force a state update
+        if (socket.readyState === WebSocket.OPEN) {
+            state_change_handler(null);
+        }
+    };
+
+    syncContainer.appendChild(statusIndicator);
+    syncContainer.appendChild(resyncButton);
+    document.body.appendChild(syncContainer);
+
+    return { statusIndicator, resyncButton, syncContainer };
+}
+
+// Update sync status display
+function updateSyncStatus(status, gap = null) {
+    const statusElement = document.getElementById('sync-status');
+    if (!statusElement) return;
+
+    syncStatus = status;
+    if (gap !== null) currentGap = gap;
+
+    let statusText = '';
+    let backgroundColor = '';
+
+    switch (status) {
+        case 'synced':
+            statusText = '✅ Synced';
+            backgroundColor = '#28a745';
+            break;
+        case 'out_of_sync':
+            statusText = `⚠️ Out of Sync (${Math.abs(currentGap).toFixed(1)}s)`;
+            backgroundColor = '#ffc107';
+            break;
+        case 'disconnected':
+            statusText = '❌ Disconnected';
+            backgroundColor = '#dc3545';
+            break;
+        case 'syncing':
+            statusText = '🔄 Syncing...';
+            backgroundColor = '#17a2b8';
+            break;
+        case 'buffering':
+            statusText = '⏳ Buffering';
+            backgroundColor = '#6f42c1';
+            break;
+        default:
+            statusText = '❓ Unknown';
+            backgroundColor = '#6c757d';
+    }
+
+    statusElement.textContent = statusText;
+    statusElement.style.background = backgroundColor;
+    lastSyncTime = Date.now();
+}
+
+// Initialize UI
+const syncUI = createSyncUI();
+
+// Monitor sync status
+function checkSyncStatus() {
+    if (socket.readyState !== WebSocket.OPEN) {
+        updateSyncStatus('disconnected');
+        return;
+    }
+
+    if (isBuffering) {
+        updateSyncStatus('buffering');
+        return;
+    }
+
+    // Check if we've received updates recently
+    const timeSinceLastUpdate = Date.now() - lastSyncTime;
+    if (timeSinceLastUpdate > 10000) { // 10 seconds without updates
+        updateSyncStatus('out_of_sync', currentGap);
+        return;
+    }
+
+    // Determine sync status based on current gap
+    if (Math.abs(currentGap) <= (video_playing ? PLAYING_THRESH : PAUSED_THRESH)) {
+        updateSyncStatus('synced', currentGap);
+    } else {
+        updateSyncStatus('out_of_sync', currentGap);
+    }
+}
+
+// Run sync status check every 2 seconds
+setInterval(checkSyncStatus, 2000);
 
 // iOS-specific video event handlers
 vid.addEventListener('loadedmetadata', () => {
@@ -59,16 +216,19 @@ vid.addEventListener('canplay', () => {
 vid.addEventListener('canplaythrough', () => {
     console.log('Video can play through without buffering');
     isBuffering = false;
+    updateSyncStatus('synced');
 });
 
 vid.addEventListener('waiting', () => {
     console.log('Video is waiting for more data (buffering)');
     isBuffering = true;
+    updateSyncStatus('buffering');
 });
 
 vid.addEventListener('stalled', () => {
     console.log('Video download has stalled');
     isBuffering = true;
+    updateSyncStatus('buffering');
 });
 
 // User interaction detection for iOS autoplay
@@ -171,6 +331,7 @@ socket.addEventListener('open', function (event) {
     console.log('Connected to WebSocket Server');
     connectionAttempts = 0;
     reconnectInterval = 1000;
+    updateSyncStatus('syncing');
     
     setTimeout(() => {
         do_time_sync();
@@ -232,8 +393,12 @@ socket.addEventListener("message", (event) => {
         // calculating the new timestamp for both cases - when the video is playing and when it is paused
         let proposed_time = (state.playing) ? ((get_global_time(correction) - state.global_timestamp) / 1000 + state.video_timestamp) : (state.video_timestamp);
         let gap = Math.abs(proposed_time - vid.currentTime);
+        currentGap = proposed_time - vid.currentTime; // Store signed gap for status display
 
         console.log(`%cGap was ${proposed_time - vid.currentTime}`, 'font-size:12px; color:purple');
+        
+        // Update sync status based on gap
+        lastSyncTime = Date.now();
         
         // Handle play/pause state first
         if (state.playing && vid.paused) {
@@ -273,12 +438,14 @@ socket.addEventListener("message", (event) => {
 // Connection error
 socket.addEventListener('error', function (event) {
     console.error('WebSocket error:', event);
+    updateSyncStatus('disconnected');
 });
 
 // Connection closed
 socket.addEventListener('close', function (event) {
     console.log('Disconnected from WebSocket Server');
     client_uid = null;
+    updateSyncStatus('disconnected');
     
     if (event.code !== 1000 && connectionAttempts < maxReconnectAttempts) {
         connectionAttempts++;
@@ -306,6 +473,7 @@ function state_change_handler(event) {
     // Check if socket is connected before sending
     if (socket.readyState !== WebSocket.OPEN) {
         console.warn('WebSocket not connected, cannot send state update');
+        updateSyncStatus('disconnected');
         return;
     }
 
@@ -334,8 +502,10 @@ function state_change_handler(event) {
     try {
         socket.send(`state_update_from_client ${JSON.stringify(state_image)}`);
         console.log('State update sent:', state_image);
+        lastSyncTime = Date.now();
     } catch (error) {
         console.error('Error sending state update:', error);
+        updateSyncStatus('disconnected');
     }
 }
 
@@ -479,10 +649,12 @@ function do_time_sync_one_cycle_forward() {
 
 async function do_time_sync() {
     console.log('Starting time synchronization...');
+    updateSyncStatus('syncing');
     
     for (let i = 0; i < num_time_sync_cycles; i++) {
         if (socket.readyState !== WebSocket.OPEN) {
             console.warn('WebSocket disconnected during time sync');
+            updateSyncStatus('disconnected');
             break;
         }
         
