@@ -6,14 +6,25 @@ const wsUrl = `${protocol}//${window.location.hostname}:${window.location.port}`
 console.log('Connecting to WebSocket at:', wsUrl);
 const socket = new WebSocket(wsUrl);
 
-// if the new tms is within this margin of the current tms, then the change is ignored for smoother viewing
-const PLAYING_THRESH = 1;
-const PAUSED_THRESH = 0.01;
+// iOS Detection
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+             (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+
+console.log(`Device detection - iOS: ${isIOS}, Safari: ${isSafari}`);
+
+// Adjusted thresholds for iOS
+const PLAYING_THRESH = isIOS ? 2.5 : 1; // Larger tolerance for iOS
+const PAUSED_THRESH = isIOS ? 0.5 : 0.01; // Much larger tolerance for iOS when paused
 
 // local state
 let video_playing = false;
 let last_updated = 0;
 let client_uid = null;
+let userHasInteracted = false;
+let videoCanSeek = false;
+let pendingSeek = null;
+let isBuffering = false;
 
 // clocks sync variables
 const num_time_sync_cycles = 10;
@@ -26,138 +37,243 @@ let correction = 0;
 // Connection status tracking
 let connectionAttempts = 0;
 const maxReconnectAttempts = 5;
-let reconnectInterval = 1000; // Start with 1 second
+let reconnectInterval = 1000;
+
+// iOS-specific video event handlers
+vid.addEventListener('loadedmetadata', () => {
+    console.log('Video metadata loaded');
+    videoCanSeek = true;
+    if (pendingSeek !== null) {
+        attemptSeek(pendingSeek);
+        pendingSeek = null;
+    }
+});
+
+vid.addEventListener('canplay', () => {
+    console.log('Video can start playing');
+    videoCanSeek = true;
+});
+
+vid.addEventListener('canplaythrough', () => {
+    console.log('Video can play through without buffering');
+    isBuffering = false;
+});
+
+vid.addEventListener('waiting', () => {
+    console.log('Video is waiting for more data (buffering)');
+    isBuffering = true;
+});
+
+vid.addEventListener('stalled', () => {
+    console.log('Video download has stalled');
+    isBuffering = true;
+});
+
+// User interaction detection for iOS autoplay
+document.addEventListener('touchstart', () => {
+    userHasInteracted = true;
+}, { once: true });
+
+document.addEventListener('click', () => {
+    userHasInteracted = true;
+}, { once: true });
+
+// iOS-safe seek function
+function attemptSeek(targetTime) {
+    if (!videoCanSeek || vid.readyState < 2) {
+        console.log('Video not ready for seeking, queuing seek request');
+        pendingSeek = targetTime;
+        return false;
+    }
+
+    // Check if the target time is within the buffered ranges
+    if (vid.buffered.length > 0) {
+        let canSeekToTarget = false;
+        for (let i = 0; i < vid.buffered.length; i++) {
+            if (targetTime >= vid.buffered.start(i) && targetTime <= vid.buffered.end(i)) {
+                canSeekToTarget = true;
+                break;
+            }
+        }
+        
+        if (!canSeekToTarget && isIOS) {
+            console.log('Target time not in buffered range, skipping seek on iOS');
+            return false;
+        }
+    }
+
+    try {
+        console.log(`Seeking from ${vid.currentTime} to ${targetTime}`);
+        vid.currentTime = targetTime;
+        return true;
+    } catch (error) {
+        console.error('Seek failed:', error);
+        return false;
+    }
+}
+
+// iOS-safe play function
+async function attemptPlay() {
+    if (!userHasInteracted && isIOS) {
+        console.log('iOS requires user interaction before play');
+        return false;
+    }
+
+    try {
+        await vid.play();
+        return true;
+    } catch (error) {
+        console.error('Play failed:', error);
+        if (error.name === 'NotAllowedError') {
+            console.log('Play blocked by browser - user interaction required');
+        }
+        return false;
+    }
+}
 
 // Connection opened
 socket.addEventListener('open', function (event) {
-	console.log('Connected to WebSocket Server');
-	connectionAttempts = 0; // Reset on successful connection
-	reconnectInterval = 1000; // Reset reconnect interval
-	
-	// Start time sync after connection
-	setTimeout(() => {
-		do_time_sync();
-	}, 100);
+    console.log('Connected to WebSocket Server');
+    connectionAttempts = 0;
+    reconnectInterval = 1000;
+    
+    // Start time sync after connection
+    setTimeout(() => {
+        do_time_sync();
+    }, 100);
 });
 
 // Got message from the server
 socket.addEventListener("message", (event) => {
 
-	// Time syncing backward server-response
-	if (event.data.startsWith("time_sync_response_backward")) {
-		let time_at_server = Number(event.data.slice("time_sync_response_backward".length + 1));
-		let under_estimate_latest = time_at_server - get_global_time(0);
+    // Time syncing backward server-response
+    if (event.data.startsWith("time_sync_response_backward")) {
+        let time_at_server = Number(event.data.slice("time_sync_response_backward".length + 1));
+        let under_estimate_latest = time_at_server - get_global_time(0);
 
-		under_estimates.push(under_estimate_latest);
-		under_estimate = median(under_estimates);
-		correction = (under_estimate + over_estimate) / 2;
+        under_estimates.push(under_estimate_latest);
+        under_estimate = median(under_estimates);
+        correction = (under_estimate + over_estimate) / 2;
 
-		console.log(`%c Updated val for under_estimate is ${under_estimate}`, "color:green");
-		console.log(`%c New correction time is ${correction} milliseconds`, 'color:red; font-size:12px');
-	}
-	
-	// Time syncing forward server-response
-	if (event.data.startsWith("time_sync_response_forward")) {
-		let calculated_diff = Number(event.data.slice("time_sync_response_forward".length + 1));
-		over_estimates.push(calculated_diff);
-		over_estimate = median(over_estimates);
-		correction = (under_estimate + over_estimate) / 2;
+        console.log(`%c Updated val for under_estimate is ${under_estimate}`, "color:green");
+        console.log(`%c New correction time is ${correction} milliseconds`, 'color:red; font-size:12px');
+    }
+    
+    // Time syncing forward server-response
+    if (event.data.startsWith("time_sync_response_forward")) {
+        let calculated_diff = Number(event.data.slice("time_sync_response_forward".length + 1));
+        over_estimates.push(calculated_diff);
+        over_estimate = median(over_estimates);
+        correction = (under_estimate + over_estimate) / 2;
 
-		console.log(`%c Updated val for over_estimate is ${over_estimate}`, "color:green");
-		console.log(`%c New correction time is ${correction} milliseconds`, 'color:red; font-size:12px');
-	}
+        console.log(`%c Updated val for over_estimate is ${over_estimate}`, "color:green");
+        console.log(`%c New correction time is ${correction} milliseconds`, 'color:red; font-size:12px');
+    }
 
-	// Video state update from server
-	if (event.data.startsWith("state_update_from_server")) {
-		let state = JSON.parse(event.data.slice("state_update_from_server".length + 1));
+    // Video state update from server
+    if (event.data.startsWith("state_update_from_server")) {
+        let state = JSON.parse(event.data.slice("state_update_from_server".length + 1));
 
-		// Whenever the client connects or reconnects
-		if (client_uid == null) {
-			client_uid = state.client_uid;
-			console.log(`%c Assigned client UID: ${client_uid}`, 'color:blue');
-		}
+        // Whenever the client connects or reconnects
+        if (client_uid == null) {
+            client_uid = state.client_uid;
+            console.log(`%c Assigned client UID: ${client_uid}`, 'color:blue');
+        }
 
-		// calculating the new timestamp for both cases - when the video is playing and when it is paused
-		let proposed_time = (state.playing) ? ((get_global_time(correction) - state.global_timestamp) / 1000 + state.video_timestamp) : (state.video_timestamp);
-		let gap = Math.abs(proposed_time - vid.currentTime);
+        // Skip updates if we're buffering on iOS
+        if (isBuffering && isIOS) {
+            console.log('Skipping sync update due to buffering on iOS');
+            return;
+        }
 
-		console.log(`%cGap was ${proposed_time - vid.currentTime}`, 'font-size:12px; color:purple');
-		if (state.playing) {
-			// tolerance while the video is playing
-			if (gap > PLAYING_THRESH) {
-				vid.currentTime = proposed_time;
-			}
-			if (vid.paused) {
-				vid.play().catch(e => {
-					console.warn('Could not auto-play video:', e);
-				});
-			}
-		} else {
-			vid.pause();
-			// condition to prevent an unnecessary seek
-			if (gap > PAUSED_THRESH) {
-				vid.currentTime = proposed_time;
-			}
-		}
-	}
+        // calculating the new timestamp for both cases - when the video is playing and when it is paused
+        let proposed_time = (state.playing) ? ((get_global_time(correction) - state.global_timestamp) / 1000 + state.video_timestamp) : (state.video_timestamp);
+        let gap = Math.abs(proposed_time - vid.currentTime);
+
+        console.log(`%cGap was ${proposed_time - vid.currentTime}`, 'font-size:12px; color:purple');
+        
+        if (state.playing) {
+            // tolerance while the video is playing
+            if (gap > PLAYING_THRESH) {
+                console.log(`Gap ${gap}s exceeds threshold ${PLAYING_THRESH}s, attempting seek`);
+                attemptSeek(proposed_time);
+            }
+            
+            if (vid.paused && userHasInteracted) {
+                console.log('Attempting to play video');
+                attemptPlay();
+            } else if (vid.paused && !userHasInteracted) {
+                console.log('Video paused but no user interaction yet');
+            }
+        } else {
+            vid.pause();
+            // condition to prevent an unnecessary seek
+            if (gap > PAUSED_THRESH) {
+                console.log(`Gap ${gap}s exceeds paused threshold ${PAUSED_THRESH}s, attempting seek`);
+                attemptSeek(proposed_time);
+            }
+        }
+    }
 });
 
 // Connection error
 socket.addEventListener('error', function (event) {
-	console.error('WebSocket error:', event);
+    console.error('WebSocket error:', event);
 });
 
 // Connection closed
 socket.addEventListener('close', function (event) {
-	console.log('Disconnected from WebSocket Server');
-	client_uid = null;
-	
-	// Attempt to reconnect if not intentionally closed
-	if (event.code !== 1000 && connectionAttempts < maxReconnectAttempts) {
-		connectionAttempts++;
-		console.log(`Attempting to reconnect... (${connectionAttempts}/${maxReconnectAttempts})`);
-		
-		setTimeout(() => {
-			window.location.reload(); // Simple reconnection by reloading page
-		}, reconnectInterval);
-		
-		reconnectInterval = Math.min(reconnectInterval * 2, 30000); // Exponential backoff, max 30 seconds
-	} else if (connectionAttempts >= maxReconnectAttempts) {
-		console.error('Max reconnection attempts reached');
-	}
+    console.log('Disconnected from WebSocket Server');
+    client_uid = null;
+    
+    // Attempt to reconnect if not intentionally closed
+    if (event.code !== 1000 && connectionAttempts < maxReconnectAttempts) {
+        connectionAttempts++;
+        console.log(`Attempting to reconnect... (${connectionAttempts}/${maxReconnectAttempts})`);
+        
+        setTimeout(() => {
+            window.location.reload();
+        }, reconnectInterval);
+        
+        reconnectInterval = Math.min(reconnectInterval * 2, 30000);
+    } else if (connectionAttempts >= maxReconnectAttempts) {
+        console.error('Max reconnection attempts reached');
+    }
 });
 
 // Send video state update to the server
-// event: the video event (ex: seeking, pause play) 
 function state_change_handler(event) {
-	// Check if socket is connected before sending
-	if (socket.readyState !== WebSocket.OPEN) {
-		console.warn('WebSocket not connected, cannot send state update');
-		return;
-	}
+    // Check if socket is connected before sending
+    if (socket.readyState !== WebSocket.OPEN) {
+        console.warn('WebSocket not connected, cannot send state update');
+        return;
+    }
 
-	if (event !== null && event !== undefined) {
-		if (event.type === 'pause')
-			video_playing = false;
-		else if (event.type === 'play')
-			video_playing = true;
-	}
-	
-	last_updated = get_global_time(correction);
+    if (event !== null && event !== undefined) {
+        if (event.type === 'pause')
+            video_playing = false;
+        else if (event.type === 'play')
+            video_playing = true;
+        
+        console.log(`Video event: ${event.type}`);
+    }
+    
+    last_updated = get_global_time(correction);
 
-	const state_image = {
-		video_timestamp: vid.currentTime,
-		last_updated: last_updated,
-		playing: video_playing,
-		global_timestamp: get_global_time(correction),
-		client_uid: client_uid
-	};
+    const state_image = {
+        video_timestamp: vid.currentTime,
+        last_updated: last_updated,
+        playing: video_playing,
+        global_timestamp: get_global_time(correction),
+        client_uid: client_uid
+    };
 
-	try {
-		socket.send(`state_update_from_client ${JSON.stringify(state_image)}`);
-	} catch (error) {
-		console.error('Error sending state update:', error);
-	}
+    try {
+        socket.send(`state_update_from_client ${JSON.stringify(state_image)}`);
+        console.log('State update sent:', state_image);
+    } catch (error) {
+        console.error('Error sending state update:', error);
+    }
 }
 
 // assigning event handlers
@@ -165,109 +281,141 @@ vid.onseeking = state_change_handler;
 vid.onplay = state_change_handler;
 vid.onpause = state_change_handler;
 
+// iOS-specific additional handlers
+vid.onseeked = () => {
+    console.log('Seek completed');
+    state_change_handler({ type: 'seeked' });
+};
+
+vid.onloadstart = () => {
+    console.log('Video load started');
+    videoCanSeek = false;
+};
+
 // handling the video ended case separately
 vid.onended = () => {
-	video_playing = false;
-	last_updated = get_global_time(correction);
-	vid.load();
-	state_change_handler();
+    video_playing = false;
+    last_updated = get_global_time(correction);
+    vid.load();
+    state_change_handler();
 }
 
-// Handle page visibility changes (user switches tabs)
+// Handle page visibility changes
 document.addEventListener('visibilitychange', () => {
-	if (!document.hidden && socket.readyState !== WebSocket.OPEN) {
-		console.log('Page became visible and socket disconnected, attempting to reconnect...');
-		setTimeout(() => window.location.reload(), 1000);
-	}
+    if (!document.hidden && socket.readyState !== WebSocket.OPEN) {
+        console.log('Page became visible and socket disconnected, attempting to reconnect...');
+        setTimeout(() => window.location.reload(), 1000);
+    }
 });
+
+// Add user interaction button for iOS
+if (isIOS && !userHasInteracted) {
+    const playButton = document.createElement('button');
+    playButton.textContent = '▶️ Tap to Enable Sync';
+    playButton.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 9999;
+        padding: 20px 40px;
+        font-size: 18px;
+        background: #007AFF;
+        color: white;
+        border: none;
+        border-radius: 8px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    `;
+    
+    playButton.onclick = async () => {
+        userHasInteracted = true;
+        await attemptPlay();
+        playButton.remove();
+    };
+    
+    document.body.appendChild(playButton);
+}
 
 //// Helper Functions ////
 
-// Get current time with optional delta correction
 function get_global_time(delta = 0) {
-	let d = new Date();
-	return d.getTime() + delta;
+    let d = new Date();
+    return d.getTime() + delta;
 }
 
-// Get the saved settings from settings.json
 async function get_settings() {
-	let s = null;
-	try {
-		const response = await fetch('/ping'); // Use ping endpoint to check server status
-		if (!response.ok) throw new Error('Server not responding');
-		
-		const settings_response = await fetch('settings.json');
-		if (!settings_response.ok) throw new Error('Settings not found');
-		
-		s = await settings_response.json();
-	} catch (error) {
-		console.error('Error fetching settings:', error);
-	}
-	return s;
+    let s = null;
+    try {
+        const response = await fetch('/ping');
+        if (!response.ok) throw new Error('Server not responding');
+        
+        const settings_response = await fetch('settings.json');
+        if (!settings_response.ok) throw new Error('Settings not found');
+        
+        s = await settings_response.json();
+    } catch (error) {
+        console.error('Error fetching settings:', error);
+    }
+    return s;
 }
 
-// Find the median of an array
 function median(values) {
-	if (values.length === 0) {
-		return 0;
-	}
+    if (values.length === 0) {
+        return 0;
+    }
 
-	values.sort((x, y) => (x - y));
-	let half = Math.floor(values.length / 2);
-	if (values.length % 2) {
-		return values[half];
-	}
-	return (values[half - 1] + values[half]) / 2.0;
+    values.sort((x, y) => (x - y));
+    let half = Math.floor(values.length / 2);
+    if (values.length % 2) {
+        return values[half];
+    }
+    return (values[half - 1] + values[half]) / 2.0;
 }
 
-// Wait certain given amount of milliseconds
 function timeout(ms) {
-	return new Promise(resolve => setTimeout(resolve, ms));
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Send the backward update request to the server
 function do_time_sync_one_cycle_backward() {
-	if (socket.readyState === WebSocket.OPEN) {
-		socket.send("time_sync_request_backward");
-	}
+    if (socket.readyState === WebSocket.OPEN) {
+        socket.send("time_sync_request_backward");
+    }
 }
 
-// Send the forward update request to the server
 function do_time_sync_one_cycle_forward() {
-	if (socket.readyState === WebSocket.OPEN) {
-		socket.send(`time_sync_request_forward ${get_global_time()}`);
-	}
+    if (socket.readyState === WebSocket.OPEN) {
+        socket.send(`time_sync_request_forward ${get_global_time()}`);
+    }
 }
 
-// Sync the client and the server, using backward and forward syncing
 async function do_time_sync() {
-	console.log('Starting time synchronization...');
-	
-	for (let i = 0; i < num_time_sync_cycles; i++) {
-		if (socket.readyState !== WebSocket.OPEN) {
-			console.warn('WebSocket disconnected during time sync');
-			break;
-		}
-		
-		await timeout(500);
-		do_time_sync_one_cycle_backward();
-		await timeout(500);
-		do_time_sync_one_cycle_forward();
-		
-		console.log(`Time sync cycle ${i + 1}/${num_time_sync_cycles} completed`);
-	}
-	
-	console.log('Time synchronization completed');
-	console.log(`Final correction: ${correction}ms`);
+    console.log('Starting time synchronization...');
+    
+    for (let i = 0; i < num_time_sync_cycles; i++) {
+        if (socket.readyState !== WebSocket.OPEN) {
+            console.warn('WebSocket disconnected during time sync');
+            break;
+        }
+        
+        await timeout(500);
+        do_time_sync_one_cycle_backward();
+        await timeout(500);
+        do_time_sync_one_cycle_forward();
+        
+        console.log(`Time sync cycle ${i + 1}/${num_time_sync_cycles} completed`);
+    }
+    
+    console.log('Time synchronization completed');
+    console.log(`Final correction: ${correction}ms`);
 }
 
-// Periodic time sync to maintain accuracy
+// Less frequent time sync to reduce iOS issues
 setInterval(() => {
-	if (socket.readyState === WebSocket.OPEN) {
-		do_time_sync();
-	}
-}, 60000); // Re-sync every minute
+    if (socket.readyState === WebSocket.OPEN) {
+        do_time_sync();
+    }
+}, 120000); // Re-sync every 2 minutes instead of 1
 
-// Log connection status
 console.log(`Client initialized. Protocol: ${protocol}`);
 console.log(`WebSocket URL: ${wsUrl}`);
+console.log(`iOS detected: ${isIOS}, User interacted: ${userHasInteracted}`);
