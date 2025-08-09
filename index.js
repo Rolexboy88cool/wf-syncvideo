@@ -3,15 +3,37 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const session = require("express-session");
 const WebSocket = require('ws');
+const https = require('https');
+const http = require('http');
 const app = express();
-const server = require('http').createServer(app);
 
-// creating the server web socket
+// importing settings from settings.json
+const settings = JSON.parse(fs.readFileSync("settings.json"));
+
+// Create HTTPS server if SSL certificates are available
+let server;
+let protocol = 'http';
+
+try {
+	// Try to load SSL certificates
+	const sslOptions = {
+		key: fs.readFileSync(settings.ssl_key_path || './ssl/private-key.pem'),
+		cert: fs.readFileSync(settings.ssl_cert_path || './ssl/certificate.pem')
+	};
+	
+	server = https.createServer(sslOptions, app);
+	protocol = 'https';
+	console.log('SSL certificates loaded successfully - using HTTPS');
+} catch (error) {
+	console.log('SSL certificates not found or invalid - falling back to HTTP');
+	console.log('To enable HTTPS, add ssl_key_path and ssl_cert_path to settings.json');
+	server = http.createServer(app);
+}
+
+// creating the server web socket with proper protocol
 const wss = new WebSocket.Server({
 	server: server
 });
-// importing settings from settings.json
-const settings = JSON.parse(fs.readFileSync("settings.json"));
 
 // server variables and video state
 const THRESH_IGNORANCE = 250;
@@ -25,7 +47,7 @@ let state = {
 	client_uid: null
 };
 
-wss.on('connection', function connection(ws) {
+wss.on('connection', function connection(ws, req) {
 	// on connection from client send update
 	users_amount += 1;
 	console.log('A new client Connected. Amount of users: ', users_amount);
@@ -76,8 +98,35 @@ wss.on('connection', function connection(ws) {
 
 });
 
-
 ////  Web server  ////
+
+// HTTPS redirect middleware (only if running HTTPS)
+if (protocol === 'https' && settings.force_https !== false) {
+	// Create HTTP server for redirecting to HTTPS
+	const httpApp = express();
+	httpApp.use((req, res) => {
+		const httpsUrl = `https://${req.get('host')}${req.url}`;
+		res.redirect(301, httpsUrl);
+	});
+	
+	const httpServer = http.createServer(httpApp);
+	httpServer.listen(settings.http_port || 80, () => {
+		console.log(`HTTP redirect server running on port ${settings.http_port || 80}`);
+	});
+}
+
+// Security headers for HTTPS
+app.use((req, res, next) => {
+	if (protocol === 'https') {
+		// HTTPS security headers
+		res.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+		res.header('X-Frame-Options', 'SAMEORIGIN');
+		res.header('X-Content-Type-Options', 'nosniff');
+		res.header('X-XSS-Protection', '1; mode=block');
+		res.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+	}
+	next();
+});
 
 // app settings
 app.use('/', express.static(__dirname));
@@ -85,25 +134,38 @@ app.use(bodyParser.urlencoded({
 	extended: true
 }));
 app.use(bodyParser.json());
+
+// Enhanced session configuration for HTTPS
 app.use(session({
-	secret: 'secret key',
+	secret: settings.session_secret || 'your-secure-secret-key-change-this',
 	resave: false,
 	saveUninitialized: false,
-	logged: false
+	logged: false,
+	cookie: {
+		secure: protocol === 'https', // Only send cookies over HTTPS
+		httpOnly: true, // Prevent XSS attacks
+		maxAge: 24 * 60 * 60 * 1000 // 24 hours
+	}
 }));
 
 // iOS-specific middleware for CORS and headers
 app.use((req, res, next) => {
 	// Enable CORS for iOS WebKit
-	res.header('Access-Control-Allow-Origin', '*');
+	res.header('Access-Control-Allow-Origin', settings.cors_origin || '*');
 	res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
 	res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+	res.header('Access-Control-Allow-Credentials', 'true');
 	
 	// iOS Safari specific headers
 	res.header('Accept-Ranges', 'bytes');
 	res.header('Cache-Control', 'no-cache');
 	
 	next();
+});
+
+// Handle OPTIONS requests for CORS
+app.options('*', (req, res) => {
+	res.sendStatus(200);
 });
 
 // home page
@@ -130,8 +192,13 @@ app.post("/login", function (req, res) {
 	}
 });
 
-// video streaming with iOS compatibility
+// video streaming with iOS compatibility and HTTPS support
 app.get("/video", function (req, res) {
+	// Check if user is logged in
+	if (!req.session.logged) {
+		return res.status(401).send("Unauthorized");
+	}
+
 	const videoPath = settings.video_path;
 	
 	// Check if file exists
@@ -192,14 +259,40 @@ app.get("/video", function (req, res) {
 	}
 });
 
-// iOS WebSocket ping endpoint for connection health
+// Health check endpoint
 app.get("/ping", function (req, res) {
-	res.json({ status: "ok", timestamp: get_time() });
+	res.json({ 
+		status: "ok", 
+		timestamp: get_time(),
+		protocol: protocol,
+		secure: protocol === 'https'
+	});
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+	console.error('Server error:', err);
+	res.status(500).send('Internal Server Error');
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+	console.log('SIGTERM received, shutting down gracefully');
+	server.close(() => {
+		console.log('Server closed');
+		process.exit(0);
+	});
 });
 
 // host server on given ip and port
-server.listen(settings.server_port,
-	() => console.log(`Server started at:${settings.server_port}`));
+server.listen(settings.server_port, () => {
+	console.log(`${protocol.toUpperCase()} Server started on port ${settings.server_port}`);
+	if (protocol === 'https') {
+		console.log(`WebSocket (WSS) available at wss://localhost:${settings.server_port}`);
+	} else {
+		console.log(`WebSocket (WS) available at ws://localhost:${settings.server_port}`);
+	}
+});
 
 // function to get the current time
 function get_time() {

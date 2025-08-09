@@ -1,5 +1,11 @@
 {
-    "server_port": 5322,
-    "video_path": "videos/ep20.mp4",
-    "password": "lind"
+  "server_port": 443,
+  "http_port": 80,
+  "password": "lind",
+  "video_path": "videos/ep20.mp4",
+  "ssl_key_path": "./ssl/private-key.pem",
+  "ssl_cert_path": "./ssl/certificate.pem",
+  "session_secret": "912-0fiqw-f0i2qwf@",
+  "force_https": true,
+  "cors_origin": "*"
 }

@@ -1,5 +1,10 @@
 const vid = document.querySelector('video');
-const socket = new WebSocket(`ws://${window.location.hostname}:${window.location.port}`);
+
+// Determine the correct WebSocket protocol and create connection
+const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+const wsUrl = `${protocol}//${window.location.hostname}:${window.location.port}`;
+console.log('Connecting to WebSocket at:', wsUrl);
+const socket = new WebSocket(wsUrl);
 
 // if the new tms is within this margin of the current tms, then the change is ignored for smoother viewing
 const PLAYING_THRESH = 1;
@@ -18,10 +23,21 @@ let over_estimate = 0;
 let under_estimate = 0;
 let correction = 0;
 
+// Connection status tracking
+let connectionAttempts = 0;
+const maxReconnectAttempts = 5;
+let reconnectInterval = 1000; // Start with 1 second
 
 // Connection opened
 socket.addEventListener('open', function (event) {
-	console.log('Connected to WS Server');
+	console.log('Connected to WebSocket Server');
+	connectionAttempts = 0; // Reset on successful connection
+	reconnectInterval = 1000; // Reset reconnect interval
+	
+	// Start time sync after connection
+	setTimeout(() => {
+		do_time_sync();
+	}, 100);
 });
 
 // Got message from the server
@@ -37,7 +53,7 @@ socket.addEventListener("message", (event) => {
 		correction = (under_estimate + over_estimate) / 2;
 
 		console.log(`%c Updated val for under_estimate is ${under_estimate}`, "color:green");
-		console.log(`%c New correction time is ${correction} miliseconds`, 'color:red; font-size:12px');
+		console.log(`%c New correction time is ${correction} milliseconds`, 'color:red; font-size:12px');
 	}
 	
 	// Time syncing forward server-response
@@ -48,7 +64,7 @@ socket.addEventListener("message", (event) => {
 		correction = (under_estimate + over_estimate) / 2;
 
 		console.log(`%c Updated val for over_estimate is ${over_estimate}`, "color:green");
-		console.log(`%c New correction time is ${correction} miliseconds`, 'color:red; font-size:12px');
+		console.log(`%c New correction time is ${correction} milliseconds`, 'color:red; font-size:12px');
 	}
 
 	// Video state update from server
@@ -58,6 +74,7 @@ socket.addEventListener("message", (event) => {
 		// Whenever the client connects or reconnects
 		if (client_uid == null) {
 			client_uid = state.client_uid;
+			console.log(`%c Assigned client UID: ${client_uid}`, 'color:blue');
 		}
 
 		// calculating the new timestamp for both cases - when the video is playing and when it is paused
@@ -70,9 +87,13 @@ socket.addEventListener("message", (event) => {
 			if (gap > PLAYING_THRESH) {
 				vid.currentTime = proposed_time;
 			}
-			vid.play()
+			if (vid.paused) {
+				vid.play().catch(e => {
+					console.warn('Could not auto-play video:', e);
+				});
+			}
 		} else {
-			vid.pause()
+			vid.pause();
 			// condition to prevent an unnecessary seek
 			if (gap > PAUSED_THRESH) {
 				vid.currentTime = proposed_time;
@@ -81,27 +102,50 @@ socket.addEventListener("message", (event) => {
 	}
 });
 
+// Connection error
+socket.addEventListener('error', function (event) {
+	console.error('WebSocket error:', event);
+});
 
 // Connection closed
 socket.addEventListener('close', function (event) {
-	console.log('Disconnected from the WS Server');
+	console.log('Disconnected from WebSocket Server');
 	client_uid = null;
+	
+	// Attempt to reconnect if not intentionally closed
+	if (event.code !== 1000 && connectionAttempts < maxReconnectAttempts) {
+		connectionAttempts++;
+		console.log(`Attempting to reconnect... (${connectionAttempts}/${maxReconnectAttempts})`);
+		
+		setTimeout(() => {
+			window.location.reload(); // Simple reconnection by reloading page
+		}, reconnectInterval);
+		
+		reconnectInterval = Math.min(reconnectInterval * 2, 30000); // Exponential backoff, max 30 seconds
+	} else if (connectionAttempts >= maxReconnectAttempts) {
+		console.error('Max reconnection attempts reached');
+	}
 });
-
 
 // Send video state update to the server
 // event: the video event (ex: seeking, pause play) 
 function state_change_handler(event) {
+	// Check if socket is connected before sending
+	if (socket.readyState !== WebSocket.OPEN) {
+		console.warn('WebSocket not connected, cannot send state update');
+		return;
+	}
+
 	if (event !== null && event !== undefined) {
 		if (event.type === 'pause')
 			video_playing = false;
-
 		else if (event.type === 'play')
 			video_playing = true;
 	}
+	
 	last_updated = get_global_time(correction);
 
-	state_image = {
+	const state_image = {
 		video_timestamp: vid.currentTime,
 		last_updated: last_updated,
 		playing: video_playing,
@@ -109,7 +153,11 @@ function state_change_handler(event) {
 		client_uid: client_uid
 	};
 
-	socket.send(`state_update_from_client ${JSON.stringify(state_image)}`);
+	try {
+		socket.send(`state_update_from_client ${JSON.stringify(state_image)}`);
+	} catch (error) {
+		console.error('Error sending state update:', error);
+	}
 }
 
 // assigning event handlers
@@ -125,27 +173,38 @@ vid.onended = () => {
 	state_change_handler();
 }
 
+// Handle page visibility changes (user switches tabs)
+document.addEventListener('visibilitychange', () => {
+	if (!document.hidden && socket.readyState !== WebSocket.OPEN) {
+		console.log('Page became visible and socket disconnected, attempting to reconnect...');
+		setTimeout(() => window.location.reload(), 1000);
+	}
+});
 
 //// Helper Functions ////
 
-// Get
+// Get current time with optional delta correction
 function get_global_time(delta = 0) {
 	let d = new Date();
 	return d.getTime() + delta;
 }
 
-
 // Get the saved settings from settings.json
 async function get_settings() {
 	let s = null;
-	await fetch('settings.json')
-		.then((response) => response.json())
-		.then((responseJson) => {
-			s = responseJson
-		});
+	try {
+		const response = await fetch('/ping'); // Use ping endpoint to check server status
+		if (!response.ok) throw new Error('Server not responding');
+		
+		const settings_response = await fetch('settings.json');
+		if (!settings_response.ok) throw new Error('Settings not found');
+		
+		s = await settings_response.json();
+	} catch (error) {
+		console.error('Error fetching settings:', error);
+	}
 	return s;
 }
-
 
 // Find the median of an array
 function median(values) {
@@ -161,31 +220,54 @@ function median(values) {
 	return (values[half - 1] + values[half]) / 2.0;
 }
 
-
-// Wait certain given amount of miliseconds
+// Wait certain given amount of milliseconds
 function timeout(ms) {
 	return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-
 // Send the backward update request to the server
 function do_time_sync_one_cycle_backward() {
-	socket.send("time_sync_request_backward");
+	if (socket.readyState === WebSocket.OPEN) {
+		socket.send("time_sync_request_backward");
+	}
 }
 
 // Send the forward update request to the server
 function do_time_sync_one_cycle_forward() {
-	socket.send(`time_sync_request_forward ${get_global_time()}`);
+	if (socket.readyState === WebSocket.OPEN) {
+		socket.send(`time_sync_request_forward ${get_global_time()}`);
+	}
 }
-
 
 // Sync the client and the server, using backward and forward syncing
 async function do_time_sync() {
+	console.log('Starting time synchronization...');
+	
 	for (let i = 0; i < num_time_sync_cycles; i++) {
+		if (socket.readyState !== WebSocket.OPEN) {
+			console.warn('WebSocket disconnected during time sync');
+			break;
+		}
+		
 		await timeout(500);
 		do_time_sync_one_cycle_backward();
 		await timeout(500);
 		do_time_sync_one_cycle_forward();
+		
+		console.log(`Time sync cycle ${i + 1}/${num_time_sync_cycles} completed`);
 	}
+	
+	console.log('Time synchronization completed');
+	console.log(`Final correction: ${correction}ms`);
 }
-do_time_sync();
+
+// Periodic time sync to maintain accuracy
+setInterval(() => {
+	if (socket.readyState === WebSocket.OPEN) {
+		do_time_sync();
+	}
+}, 60000); // Re-sync every minute
+
+// Log connection status
+console.log(`Client initialized. Protocol: ${protocol}`);
+console.log(`WebSocket URL: ${wsUrl}`);
