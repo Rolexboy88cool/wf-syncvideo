@@ -1,6 +1,5 @@
 {
-  "server_port": 443,
-  "http_port": 80,
+  "server_port": 3001,
   "password": "lind",
   "video_path": "videos/ep20.mp4",
   "ssl_key_path": "./ssl/private-key.pem",
