@@ -14,8 +14,8 @@ const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 console.log(`Device detection - iOS: ${isIOS}, Safari: ${isSafari}`);
 
 // Adjusted thresholds for iOS
-const PLAYING_THRESH = isIOS ? 2.5 : 1; // Larger tolerance for iOS
-const PAUSED_THRESH = isIOS ? 0.5 : 0.01; // Much larger tolerance for iOS when paused
+const PLAYING_THRESH = isIOS ? 2.5 : 1;
+const PAUSED_THRESH = isIOS ? 0.5 : 0.01;
 
 // local state
 let video_playing = false;
@@ -25,6 +25,8 @@ let userHasInteracted = false;
 let videoCanSeek = false;
 let pendingSeek = null;
 let isBuffering = false;
+let localVideoState = 'paused'; // Track our local state separately
+let ignoreNextEvent = false; // Flag to ignore events we trigger
 
 // clocks sync variables
 const num_time_sync_cycles = 10;
@@ -72,10 +74,12 @@ vid.addEventListener('stalled', () => {
 // User interaction detection for iOS autoplay
 document.addEventListener('touchstart', () => {
     userHasInteracted = true;
+    console.log('User interaction detected via touch');
 }, { once: true });
 
 document.addEventListener('click', () => {
     userHasInteracted = true;
+    console.log('User interaction detected via click');
 }, { once: true });
 
 // iOS-safe seek function
@@ -86,7 +90,6 @@ function attemptSeek(targetTime) {
         return false;
     }
 
-    // Check if the target time is within the buffered ranges
     if (vid.buffered.length > 0) {
         let canSeekToTarget = false;
         for (let i = 0; i < vid.buffered.length; i++) {
@@ -104,6 +107,7 @@ function attemptSeek(targetTime) {
 
     try {
         console.log(`Seeking from ${vid.currentTime} to ${targetTime}`);
+        ignoreNextEvent = true;
         vid.currentTime = targetTime;
         return true;
     } catch (error) {
@@ -120,14 +124,45 @@ async function attemptPlay() {
     }
 
     try {
+        ignoreNextEvent = true;
+        localVideoState = 'playing';
         await vid.play();
+        console.log('Video play succeeded');
         return true;
     } catch (error) {
         console.error('Play failed:', error);
+        localVideoState = 'paused';
         if (error.name === 'NotAllowedError') {
             console.log('Play blocked by browser - user interaction required');
         }
         return false;
+    }
+}
+
+// iOS-safe pause function
+function attemptPause() {
+    try {
+        ignoreNextEvent = true;
+        localVideoState = 'paused';
+        vid.pause();
+        console.log('Video pause succeeded');
+        return true;
+    } catch (error) {
+        console.error('Pause failed:', error);
+        return false;
+    }
+}
+
+// Force sync video state
+function forceVideoState(shouldPlay) {
+    console.log(`Force video state: ${shouldPlay ? 'play' : 'pause'}, current paused: ${vid.paused}`);
+    
+    if (shouldPlay && vid.paused) {
+        console.log('Video should be playing but is paused - attempting play');
+        attemptPlay();
+    } else if (!shouldPlay && !vid.paused) {
+        console.log('Video should be paused but is playing - attempting pause');
+        attemptPause();
     }
 }
 
@@ -137,7 +172,6 @@ socket.addEventListener('open', function (event) {
     connectionAttempts = 0;
     reconnectInterval = 1000;
     
-    // Start time sync after connection
     setTimeout(() => {
         do_time_sync();
     }, 100);
@@ -180,11 +214,20 @@ socket.addEventListener("message", (event) => {
             console.log(`%c Assigned client UID: ${client_uid}`, 'color:blue');
         }
 
+        // Skip updates from our own client
+        if (state.client_uid === client_uid) {
+            console.log('Ignoring update from own client');
+            return;
+        }
+
         // Skip updates if we're buffering on iOS
         if (isBuffering && isIOS) {
             console.log('Skipping sync update due to buffering on iOS');
             return;
         }
+
+        console.log(`%c Received state update: playing=${state.playing}, video_timestamp=${state.video_timestamp}`, 'color:orange');
+        console.log(`%c Current video state: paused=${vid.paused}, currentTime=${vid.currentTime}`, 'color:orange');
 
         // calculating the new timestamp for both cases - when the video is playing and when it is paused
         let proposed_time = (state.playing) ? ((get_global_time(correction) - state.global_timestamp) / 1000 + state.video_timestamp) : (state.video_timestamp);
@@ -192,27 +235,38 @@ socket.addEventListener("message", (event) => {
 
         console.log(`%cGap was ${proposed_time - vid.currentTime}`, 'font-size:12px; color:purple');
         
+        // Handle play/pause state first
+        if (state.playing && vid.paused) {
+            console.log('Server says playing, but video is paused - attempting play');
+            if (userHasInteracted || !isIOS) {
+                attemptPlay();
+            } else {
+                console.log('Cannot play - no user interaction on iOS');
+            }
+        } else if (!state.playing && !vid.paused) {
+            console.log('Server says paused, but video is playing - attempting pause');
+            attemptPause();
+        }
+
+        // Then handle seeking
         if (state.playing) {
             // tolerance while the video is playing
             if (gap > PLAYING_THRESH) {
                 console.log(`Gap ${gap}s exceeds threshold ${PLAYING_THRESH}s, attempting seek`);
                 attemptSeek(proposed_time);
             }
-            
-            if (vid.paused && userHasInteracted) {
-                console.log('Attempting to play video');
-                attemptPlay();
-            } else if (vid.paused && !userHasInteracted) {
-                console.log('Video paused but no user interaction yet');
-            }
         } else {
-            vid.pause();
-            // condition to prevent an unnecessary seek
+            // condition to prevent an unnecessary seek when paused
             if (gap > PAUSED_THRESH) {
                 console.log(`Gap ${gap}s exceeds paused threshold ${PAUSED_THRESH}s, attempting seek`);
                 attemptSeek(proposed_time);
             }
         }
+
+        // Force state check after a delay to ensure consistency
+        setTimeout(() => {
+            forceVideoState(state.playing);
+        }, 100);
     }
 });
 
@@ -226,7 +280,6 @@ socket.addEventListener('close', function (event) {
     console.log('Disconnected from WebSocket Server');
     client_uid = null;
     
-    // Attempt to reconnect if not intentionally closed
     if (event.code !== 1000 && connectionAttempts < maxReconnectAttempts) {
         connectionAttempts++;
         console.log(`Attempting to reconnect... (${connectionAttempts}/${maxReconnectAttempts})`);
@@ -243,6 +296,13 @@ socket.addEventListener('close', function (event) {
 
 // Send video state update to the server
 function state_change_handler(event) {
+    // Ignore events that we triggered programmatically
+    if (ignoreNextEvent) {
+        ignoreNextEvent = false;
+        console.log('Ignoring programmatically triggered event');
+        return;
+    }
+
     // Check if socket is connected before sending
     if (socket.readyState !== WebSocket.OPEN) {
         console.warn('WebSocket not connected, cannot send state update');
@@ -250,12 +310,15 @@ function state_change_handler(event) {
     }
 
     if (event !== null && event !== undefined) {
-        if (event.type === 'pause')
+        if (event.type === 'pause') {
             video_playing = false;
-        else if (event.type === 'play')
+            localVideoState = 'paused';
+        } else if (event.type === 'play') {
             video_playing = true;
+            localVideoState = 'playing';
+        }
         
-        console.log(`Video event: ${event.type}`);
+        console.log(`Video event: ${event.type}, local state: ${localVideoState}`);
     }
     
     last_updated = get_global_time(correction);
@@ -284,7 +347,9 @@ vid.onpause = state_change_handler;
 // iOS-specific additional handlers
 vid.onseeked = () => {
     console.log('Seek completed');
-    state_change_handler({ type: 'seeked' });
+    if (!ignoreNextEvent) {
+        state_change_handler({ type: 'seeked' });
+    }
 };
 
 vid.onloadstart = () => {
@@ -292,9 +357,32 @@ vid.onloadstart = () => {
     videoCanSeek = false;
 };
 
+// Additional iOS event handlers for better state tracking
+vid.addEventListener('play', () => {
+    console.log('Play event fired, video.paused =', vid.paused);
+    localVideoState = 'playing';
+});
+
+vid.addEventListener('pause', () => {
+    console.log('Pause event fired, video.paused =', vid.paused);
+    localVideoState = 'paused';
+});
+
+// Monitor for state inconsistencies
+setInterval(() => {
+    if (isIOS) {
+        const actualState = vid.paused ? 'paused' : 'playing';
+        if (localVideoState !== actualState) {
+            console.warn(`State mismatch detected: local=${localVideoState}, actual=${actualState}`);
+            localVideoState = actualState;
+        }
+    }
+}, 1000);
+
 // handling the video ended case separately
 vid.onended = () => {
     video_playing = false;
+    localVideoState = 'paused';
     last_updated = get_global_time(correction);
     vid.load();
     state_change_handler();
@@ -329,6 +417,7 @@ if (isIOS && !userHasInteracted) {
     
     playButton.onclick = async () => {
         userHasInteracted = true;
+        console.log('User interaction button clicked');
         await attemptPlay();
         playButton.remove();
     };
@@ -414,7 +503,7 @@ setInterval(() => {
     if (socket.readyState === WebSocket.OPEN) {
         do_time_sync();
     }
-}, 120000); // Re-sync every 2 minutes instead of 1
+}, 120000); // Re-sync every 2 minutes
 
 console.log(`Client initialized. Protocol: ${protocol}`);
 console.log(`WebSocket URL: ${wsUrl}`);
