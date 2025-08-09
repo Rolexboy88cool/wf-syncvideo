@@ -6,6 +6,6 @@
   "ssl_key_path": "./ssl/private-key.pem",
   "ssl_cert_path": "./ssl/certificate.pem",
   "session_secret": "912-0fiqw-f0i2qwf@",
-  "force_https": true,
+  "force_https": false,
   "cors_origin": "*"
 }
